@@ -1,0 +1,400 @@
+---
+title: "Word_Cloud_Each_Sample"
+output: pdf_document
+date: "2026-02-17"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+
+
+
+Data Under Consideration:
+```{r, echo=FALSE}
+library(dplyr)
+pb <- read.csv("Data/PB.csv") #Change file location based on where your file is
+
+pb_feedback <- pb[, c("Unique_Panelist_ID", "Sample", "Comments_aroma_liking", "Comments_aroma_disliking", "Aroma_Liking_A")] 
+
+pb_concat_feedback <- pb_feedback %>% 
+  distinct()
+
+head(pb_concat_feedback, 10)
+```
+
+
+
+Cleaning the text data:
+
+1. Rename columns for easier coding  
+
+2. Recode things that look like NAs or null values to NA  
+
+3. Drop the rows where both positive and negative reviews are NA or null  
+
+4. Unpivot the data each customer x sample combination will have 2 rows one for positive and one for negative review (need this for the way I created the wordclouds)
+
+5. Tokenize the words and remove stop words
+
+6. Count the frequency of words (by sample and sentiment) and then calculate TF-Idf (Term frequency Inverse Document frequency)
+
+
+TF-Idf penalizes generic words that are frequently occuring in reviews for other samples
+
+
+TF = Probability (proportion) of seeing a word in a document (one sample X sentiment combination)
+IDF = log(N/df_w), 
+
+N = the total number of documents (total sample x sentiment combinations),
+
+df_w = number of documents containing the given word
+
+TF-idf = TF * IDF = P(observing given word in your document) * how often the word appears overall
+
+Intuituion: We are penalizing common words, we want words that correlate with specific cheese to have high values.
+
+
+
+```{r, include=FALSE}
+library(tidyverse)
+library(tidytext)
+library(wordcloud)
+library(RColorBrewer)
+library(tm)
+
+
+#Renaming columns:
+df <- pb_concat_feedback
+df <- df %>%
+  rename(
+    positive_text = Comments_aroma_liking,
+    negative_text = Comments_aroma_disliking
+  )
+
+missing_like <- function(x) {
+  x <- trimws(tolower(x))
+  x[x %in% c("n/a", "na", "nan", "null", "nil", "none", "missing", 
+               "not available", "")] <- NA
+  x
+}
+
+#Replace NA like Values with NA
+df <- df %>%
+  mutate(across(c(positive_text, negative_text), missing_like))
+
+#Rows where both positive and negative are NA
+rows_both_na <- df %>%
+  filter(is.na(positive_text) & is.na(negative_text))
+
+#Drop the rows where both are NA
+df <- df %>%
+  filter(!(is.na(positive_text) & is.na(negative_text)))
+
+#If Positive review is NA but there's a negative review, impute with "terrible" because I am assuming this means the customer didn't find anything positive about the cheese
+#If Negative review is NA but there's a positive review, impute with "amazing" because I am assuming this means the customer didn't find anything negative about the cheese
+df <- df %>%
+  mutate(
+    positive_text = ifelse(
+      is.na(positive_text) & !is.na(negative_text),
+      "terrible",
+      positive_text
+    ),
+    negative_text = ifelse(
+      is.na(negative_text) & !is.na(positive_text),
+      "amazing",
+      negative_text
+    )
+  )
+```
+
+
+
+Unpivot for comparisons and easier computations, remove stop words, tokenize and calculate frequency
+```{r, include=FALSE}
+#Putting data in correct format - unpivoting
+df_long <- df %>%
+  pivot_longer(
+    cols = c(positive_text, negative_text),
+    names_to = "sentiment",
+    values_to = "text"
+  ) %>%
+  mutate(sentiment = ifelse(sentiment == "positive_text", "positive", "negative"))
+#Text cleaning and tokenization
+data("stop_words")
+
+tokens <- df_long %>%
+  mutate(text = str_to_lower(text)) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%#Removing stop words like is, are etc.
+  filter(!str_detect(word, "^[0-9]+$"))
+
+
+#Word counts by sample and sentiment - counting tokenized words
+word_counts <- tokens %>%
+  count(Sample, sentiment, word, sort = TRUE)
+
+#Tf-idf for each sample - use this for wordclouds, penalizes generic words
+#doc_id = paste(Sample, sentiment)
+tfidf <- word_counts %>%
+  unite(doc_id, Sample, sentiment, remove = FALSE) %>%
+  bind_tf_idf(word, doc_id, n)
+```
+
+
+
+Function to create wordclouds given Sample and whether you want positive or negative review takes ch and pos as input. 
+
+ch: Sample Name (A, B, C,...)
+
+pos: positive or negative. 
+
+
+Set ch = sample (A, B, C,....) and pos = "positive" if you'd like a wordcloud for positive review and "negative" if you'd like one for negative reviews.
+
+```{r, include=FALSE}
+word_cloud_review <- function(ch, pos){
+  op <- par(mar = c(5, 4, 4, 2))  # increase bottom margin
+  
+  tfidf %>%
+  filter(Sample == ch, sentiment == pos) %>%
+  with({wordcloud(
+    words = word,
+    freq = tf_idf,
+    max.words = 100,#Reduce this if you think too many unnecassary words are showing up
+    colors = brewer.pal(8, "Dark2"),
+    
+  )
+    mtext(
+        text = paste(str_to_upper(pos), "REVIEWS -", ch),
+        side = 1,      # bottom
+        line = 4,      # distance from plot
+        cex = 1.1
+      )}
+  )
+  par(op)
+}
+```
+
+
+
+Sample A:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("A", "positive")
+```
+
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("A", "negative")
+```
+
+
+
+Sample B:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("B", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("B", "negative")
+```
+
+
+Sample C:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("C", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("C", "negative")
+```
+
+
+
+Sample D:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("D", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("D", "negative")
+```
+
+
+
+Sample E:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("E", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("E", "negative")
+```
+
+
+
+Sample F:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("F", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("F", "negative")
+```
+
+
+
+Sample G:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("G", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("G", "negative")
+```
+
+
+
+Sample H:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("H", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("H", "negative")
+```
+
+
+
+Sample I:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("I", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("I", "negative")
+```
+
+
+
+Sample J:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("J", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("J", "negative")
+```
+
+
+
+
+Sample K:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("K", "positive")
+```
+Sample K is the most liked cheese by Median Aroma Liking
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("K", "negative")
+```
+
+
+
+Sample L:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("L", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("L", "negative")
+```
+
+
+
+Sample M:
+
+Positive Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("M", "positive")
+```
+
+
+Negative Reviews:
+```{r, echo=FALSE}
+#Positive review
+word_cloud_review("M", "negative")
+```
