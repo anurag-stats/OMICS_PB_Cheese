@@ -1,7 +1,7 @@
 # OMICS_PB_Cheese
 Objective: Find the drivers for liking aroma of plant-based cheeses based on sensory and chemical indicators and subject level data.
 
-This was a project from when I worked at Statistical Consulting Service at the Ohio State University. All of the statistical and data analysis was done by me and I took into consideration the regular feedback from my client.
+This was a project from when I worked at Statistical Consulting Service at the Ohio State University. All of the statistical and data analysis was done by me and I took into consideration the regular feedback provided by my client.
 
 We considered OMICs data for 20 different samples of cheeses and randomly assigned each sample of cheese to each test subject and had them provide sensory evaluations of these cheeses. We additionally collected some subject level data such as demographics data, inclination to plant based cheeses and preferences, preference for particular dairy cheeses etc. Our goal was to find the chemicals which should be reinjected into the particular plant-based cheese that would make someone more likely to rate that cheese more positively, not just based on chemical data but also accounting the variability introduced by personal preferences and/or biases.
 
