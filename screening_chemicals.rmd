@@ -1,0 +1,1089 @@
+---
+output:
+  pdf_document: default
+  html_document: default
+---
+# Chemicals that Drive Aroma Ratings
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+We want to remove the effect of the subjects from our response, this will give us better results for
+chemicals that drive aroma scores. We will residualize the response by fitting a model for 
+Aroma ~ Subject variables, then find the residuals, we will then use the residuals as our response 
+and implement 3 things to screen and test screening ElasticNet, SIS and PLS. We will also use ML models
+like XGBoost to find the important variables but I'd be very concerned about using them because of the
+size of our dataset.
+
+```{r include=FALSE}
+library(tidyverse)
+library(lme4)
+library(lmerTest)
+library(glmnet)
+```
+
+```{r include=FALSE}
+subject_df <- read.csv("Subject_Level_Dairy_Cheese_latent_factors.csv")
+df_chem <- read.csv("Cheese_Chemical_Data.csv")
+rating_df <- read.csv("Subject_wise_Cheese_Ratings.csv")
+```
+
+Variables to consider for subject level data: "Frequency_of_PB_cheese", "Diet", "Age", 
+"Cheese_MR1", "Cheese_MR2".
+
+Data Prep:
+
+Chemical Data:
+```{r}
+chem_cols <- colnames(df_chem)[4:54]
+
+chem_screen_df <- df_chem %>%
+  select(all_of(c("PrimaryID", chem_cols)))
+
+
+
+#Log-transforming the chemical data
+chem_screen_df[, 2:52] <- log(chem_screen_df[, 2:52])
+
+X_chem_scaled <- chem_screen_df
+
+X_chem_scaled[, chem_cols] = chem_screen_df %>%
+  select(all_of(chem_cols)) %>%
+  scale() 
+head(X_chem_scaled)
+```
+
+
+Ratings and Subject Data:
+```{r}
+subject_vars <- c("Frequency_of_PB_cheese", "Diet", 
+                "Age", "Cheese_MR1", "Cheese_MR2")
+
+analysis_df <- rating_df %>%
+  left_join(subject_df, by = "Unique_Panelist_ID")
+
+needed_cols <- c("Unique_Panelist_ID", "PrimaryID", "Aroma_A", subject_vars)
+
+analysis_df <- analysis_df %>%
+  select(all_of(needed_cols))
+
+analysis_df$Diet <- factor(analysis_df$Diet)
+
+analysis_df$Age <- factor(analysis_df$Age, ordered = T)
+analysis_df$Unique_Panelist_ID <- factor(analysis_df$Unique_Panelist_ID)
+```
+
+
+Alternate: One big joint model
+
+
+Mixed effects model with a random intercept for subject:
+
+```{r}
+m_subject <- lmer(data = analysis_df, 
+                formula = Aroma_A ~ (1|Unique_Panelist_ID)+ 
+                Frequency_of_PB_cheese + Age + Diet + Cheese_MR1 + Cheese_MR2,
+                REML = TRUE)
+
+#Residualizing the response
+analysis_df$resid_subject <- resid(m_subject)
+
+summary(m_subject)
+```
+
+
+Cheese level data for response:
+
+```{r}
+cheese_target_df <- analysis_df %>%
+  group_by(PrimaryID) %>%
+  summarise(
+    mean_rating = mean(Aroma_A),
+    mean_resid_subject = mean(resid_subject),
+    n_ratings = n(),
+    .groups = "drop"
+  )
+names(cheese_target_df)[1] <- "PrimaryID"
+
+write.csv(cheese_target_df, 
+"cheese_level_residualized_target.csv", row.names = FALSE)
+```
+
+
+Merging residualized response with cheese level data (chemicals):
+
+```{r}
+screen_df <- cheese_target_df %>%
+            left_join(X_chem_scaled, by = "PrimaryID")
+
+screen_df[!complete.cases(screen_df),]
+
+rbind(head(screen_df), tail(screen_df))
+```
+
+
+Now we will move to the first screening method using Elastic Net (this will shrink collinear 
+and unimportant chemicals coefficient to 0).
+(Elastic Net has L1 and L2 Regularization terms)
+Elastic net's penalty adds the following to the usual loss function of linear regression:
+$$ g(\beta) = \lambda [\alpha ||\beta||_1 + \frac{1-\alpha}{2} ||\beta||_2^2] $$
+
+
+```{r}
+set.seed(123)
+
+X <- screen_df %>%
+  select(all_of(chem_cols)) %>%
+  as.matrix()
+
+y <- screen_df[["mean_resid_subject"]]
+
+cv_enet <- cv.glmnet(
+  x = X,
+  y = y,
+  alpha = 0.5,          # elastic net
+  family = "gaussian",
+  standardize = TRUE,
+  nfolds = min(10, nrow(X))
+)
+plot(cv_enet)
+```
+
+lambda is the regularization term, picking between -log(lambda) between 2.5 and 3 seems reasonable,
+bigger lambda's seem to have diminishing returns and provide a more complex model.
+Let's consider -log(lambda) = 2.8, i.e. lambda = exp(-2.8), we will compare this to the optimal 
+lambda from cross validation and check which gives us better results, I'd like a simpler model.
+
+```{r}
+lambda_custom <- exp(-2.8)
+lambda_custom
+```
+
+Comparing Elastic Net models:
+```{r}
+coef_min <- coef(cv_enet, s = "lambda.min")
+coef_1se <- coef(cv_enet, s = "lambda.1se")
+coef_custom <- coef(cv_enet, s = lambda_custom)
+
+coef_min_df <- tibble(
+  chemical = rownames(coef_min),
+  coef_lambda_min = as.numeric(coef_min)
+) %>%
+  filter(chemical != "(Intercept)") %>%
+  mutate(
+    selected_lambda_min = coef_lambda_min != 0,
+    abs_coef_lambda_min = abs(coef_lambda_min)
+  )
+
+coef_1se_df <- tibble(
+  chemical = rownames(coef_1se),
+  coef_lambda_1se = as.numeric(coef_1se)
+) %>%
+  filter(chemical != "(Intercept)") %>%
+  mutate(
+    selected_lambda_1se = coef_lambda_1se != 0,
+    abs_coef_lambda_1se = abs(coef_lambda_1se)
+  )
+
+coef_custom_df <- tibble(
+  chemical = rownames(coef_custom),
+  coef_custom = as.numeric(coef_custom)
+) %>%
+  filter(chemical != "(Intercept)") %>%
+  mutate(
+    selected_custom = coef_custom != 0,
+    abs_coef_custom = abs(coef_custom)
+  )
+
+enet_compare <- coef_min_df %>%
+  select(chemical, coef_lambda_min, selected_lambda_min, 
+        abs_coef_lambda_min) %>%
+  left_join(
+    coef_1se_df %>%
+      select(chemical, coef_lambda_1se, 
+            selected_lambda_1se, abs_coef_lambda_1se),
+    by = "chemical"
+  ) %>%
+  left_join(
+    coef_custom_df %>%
+      select(chemical, coef_custom, selected_custom, abs_coef_custom),
+    by = "chemical"
+  ) %>%
+  arrange(desc(abs_coef_lambda_min))
+
+#enet_compare
+
+```
+
+```{r}
+shortlist_min <- enet_compare %>%
+  filter(selected_lambda_min) %>%
+  arrange(desc(abs_coef_lambda_min))
+
+shortlist_1se <- enet_compare %>%
+  filter(selected_lambda_1se) %>%
+  arrange(desc(abs_coef_lambda_1se))
+
+shortlist_custom <- enet_compare %>%
+  filter(selected_custom) %>%
+  arrange(desc(abs_coef_custom))
+
+```
+
+```{r}
+write.csv(enet_compare, "Elastic_Net_Chemical_Screening_Results.csv", 
+        row.names = F)
+
+```
+
+
+
+Classical SIS screening (using pairwise Pearson correlation of X v/s y to screen):
+```{r}
+library(dccpp)
+library(tidyverse)
+sis_linear_tbl <- tibble(
+  chemical = chem_cols,
+  sis_corr = map_dbl(chem_cols, ~ cor(X[, .x], y, use = "complete.obs")),
+  sis_abs_corr = abs(sis_corr)
+) %>%
+  arrange(desc(sis_abs_corr)) %>%
+  mutate(
+    sis_rank = row_number(),
+    sis_top15 = sis_rank <= 15,
+    sis_top20 = sis_rank <= 20,
+    sis_top25 = sis_rank <= 25
+  )
+
+sis_dcorr_tbl <- tibble(
+  chemical = chem_cols,
+  dc_sis = map_dbl(chem_cols, ~ dccpp::dcor(X[, .x], y))
+) %>%
+  arrange(desc(dc_sis)) %>%
+  mutate(
+    dc_sis_rank = row_number(),
+    dc_sis_top15 = dc_sis_rank <= 15,
+    dc_sis_top20 = dc_sis_rank <= 20,
+    dc_sis_top25 = dc_sis_rank <= 25
+  )
+```
+
+Linear SIS uses pearson correlation so we are considering linear relationships, the other SIS considers
+distance correlation and is basically looking at association, so it captures non-linear relationships.
+
+Compiled Table with SIS results
+
+```{r}
+sis_compare <- sis_linear_tbl %>%
+  select(
+    chemical,
+    sis_corr,
+    sis_abs_corr,
+    sis_rank,
+    sis_top15,
+    sis_top20,
+    sis_top25
+  ) %>%
+  left_join(
+    sis_dcorr_tbl %>%
+      select(
+        chemical,
+        dc_sis,
+        dc_sis_rank,
+        dc_sis_top15,
+        dc_sis_top20,
+        dc_sis_top25
+      ),
+    by = "chemical"
+  ) %>%
+  mutate(
+    mean_sis_rank = (sis_rank + dc_sis_rank) / 2,
+    selected_by_both_top15 = sis_top15 & dc_sis_top15,
+    selected_by_both_top20 = sis_top20 & dc_sis_top20,
+    selected_by_both_top25 = sis_top25 & dc_sis_top25,
+    selected_by_either_top15 = sis_top15 | dc_sis_top15,
+    selected_by_either_top20 = sis_top20 | dc_sis_top20,
+    selected_by_either_top25 = sis_top25 | dc_sis_top25
+  ) %>%
+  arrange(mean_sis_rank)
+
+#head(sis_compare)
+
+write.csv(sis_compare, "SIS_Chemical_Screening_Results.csv", row.names = FALSE)
+
+```
+
+PCA finds directions explaining variation in X.
+PLS finds directions in X that are most related to Y.
+Sparse PLS forces many variable weights to 0 so only selected predictors define the components.
+Other than that, it works similar to PLS.
+
+SPLS:
+Tuning hyperparameters for SPLS:
+
+Run this chunk to install mixOmics, you might need to do something different for a different version
+of R:
+```{r}
+#install.packages("BiocManager")
+#options(repos = BiocManager::repositories())
+#getOption("repos") #- make sure this shows you all repos not just CRAN
+#install.packages("ggrepel", repos = "https://cloud.r-project.org", type = "binary")
+#BiocManager::install("mixOmics", ask = FALSE, update = FALSE)
+#library(mixOmics)
+```
+
+```{r}
+# options(repos = c(CRAN = "https://cloud.r-project.org"))
+# install.packages("ggrepel")
+# R.version.string
+# sessionInfo()
+```
+
+```{r}
+#install.packages("BiocManager")
+#BiocManager::install("mixOmics")
+library(mixOmics)
+set.seed(42)
+tune_spls_res <- tune.spls(
+  X = as.matrix(X),
+  Y = y,
+  ncomp = 2,
+  test.keepX = c(5, 10, 15, 20, 25),
+  validation = "Mfold",
+  folds = 5,
+  nrepeat = 20,
+  measure = "MSE",
+  mode = "regression",
+  progressBar = TRUE
+)
+```
+
+Optimal hyperparameters:
+```{r}
+best_keepX <- tune_spls_res$choice.keepX
+best_ncomp <- tune_spls_res$choice.ncomp
+
+paste0("Optimal keepX: ", best_keepX, ", optimal ncomp: ", best_ncomp$ncomp)
+```
+
+KeepX = (15, 20), 20, ncomp = 2
+
+2 PCs will be retained and 15 variables load on one PC and 20 on the other.
+Variables are chosen through latent component optimization criterion, which is based on constructing
+components that maximize covariance with the response while imposing sparsity.
+There could be cross loadings.
+
+I'd be inclined to think about the PCs as latent factors and less like just some projections.
+
+Fitting the tuned models:
+```{r}
+best_keepX <- c(15, 20)
+best_ncomp <- 2
+X_mat <- as.matrix(X)
+spls_fit <- spls(
+  X = X_mat,
+  Y = y,
+  ncomp = best_ncomp,
+  keepX = best_keepX,
+  mode = "regression"
+)
+
+
+#Extracting selected variables
+loadings_mat <- spls_fit$loadings$X
+
+selected_list <- lapply(seq_len(best_ncomp), function(j) {
+  rownames(mixOmics::selectVar(spls_fit, comp = j)$X$value)
+})
+
+names(selected_list) <- paste0("comp", seq_len(best_ncomp))
+
+all_selected <- unique(unlist(selected_list))
+
+spls_tbl <- tibble(
+  chemical = rownames(loadings_mat),
+  spls_selected = chemical %in% all_selected
+)
+```
+
+Creating the results table:
+```{r}
+for (j in seq_len(ncol(loadings_mat))) {
+  spls_tbl[[paste0("loading_comp", j)]] <- as.numeric(loadings_mat[, j])
+}
+
+loading_cols <- grep("^loading_comp", names(spls_tbl), value = TRUE)
+
+spls_tbl <- spls_tbl %>%
+  mutate(
+    spls_importance = rowSums(across(all_of(loading_cols), ~ abs(.x)))
+  ) %>%
+  arrange(desc(spls_importance)) %>%
+  mutate(
+    spls_rank = row_number(),
+    spls_top15 = spls_rank <= 15,
+    spls_top20 = spls_rank <= 20,
+    spls_top25 = spls_rank <= 25
+  )
+
+for (j in seq_len(best_ncomp)) {
+  spls_tbl[[paste0("selected_comp", j)]] <- spls_tbl$chemical %in% selected_list[[j]]
+}
+```
+
+Saving the results:
+```{r}
+write.csv(spls_tbl, "Sparse_PLS_Chemical_Screening_Results.csv", row.names = F)
+
+```
+
+
+Finally, we'll screen variables and give ranks based on XGBoost (ML model)
+
+This is probably too complex of a solution but I hope when we are considering an ensemble of the
+different screening techniques I'll give low weights to XGBoost rankings so that this does not sway
+our final ranking too much.
+
+```{r}
+library(xgboost)
+set.seed(42)
+dtrain <- xgb.DMatrix(data = X_mat, label = y)
+
+xgb_fit <- xgb.train(
+  params = list(
+    objective = "reg:squarederror",
+    eval_metric = "rmse",
+    eta = 0.05,
+    max_depth = 4,
+    min_child_weight = 3,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    lambda = 1,
+    alpha = 0
+  ),
+  data = dtrain,
+  nrounds = 200,
+  verbose = 0
+)
+
+xgb_imp <- xgb.importance(
+  feature_names = colnames(X),
+  model = xgb_fit
+)
+```
+
+xgb_gain is the entropy gain or how important the variable is.
+xgb_cover shows how broadly the variable's splits affect observations.
+xgb_frequency is how often the variable was used in splitting
+
+Use the Gain to decide importance.
+
+Creating a results table for XGBoost:
+```{r}
+xgb_tbl <- tibble(chemical = colnames(X)) %>%
+  left_join(
+    as_tibble(xgb_imp) %>%
+      transmute(
+        chemical = Feature,
+        xgb_gain = Gain,
+        xgb_cover = Cover,
+        xgb_frequency = Frequency
+      ),
+    by = "chemical"
+  ) %>%
+  mutate(
+    xgb_gain = replace_na(xgb_gain, 0),
+    xgb_cover = replace_na(xgb_cover, 0),
+    xgb_frequency = replace_na(xgb_frequency, 0)
+  ) %>%
+  arrange(desc(xgb_gain)) %>%
+  mutate(
+    xgb_rank = row_number(),
+    xgb_top15 = xgb_rank <= 15,
+    xgb_top20 = xgb_rank <= 20,
+    xgb_top25 = xgb_rank <= 25
+  )
+write.csv(xgb_tbl, "XGBoost_Screening_Results.csv", row.names = FALSE)
+
+```
+
+Giving ranks to Elastic Net Screening:
+```{r}
+enet_compare <- enet_compare %>%
+  mutate(
+    enet_rank_lambda_min = min_rank(desc(abs_coef_lambda_min)),
+    enet_rank_lambda_1se = min_rank(desc(abs_coef_lambda_1se)),
+    enet_rank_custom = min_rank(desc(abs_coef_custom)),
+    
+    enet_top15_lambda_min = enet_rank_lambda_min <= 15,
+    enet_top20_lambda_min = enet_rank_lambda_min <= 20,
+    enet_top25_lambda_min = enet_rank_lambda_min <= 25,
+    
+    enet_top15_lambda_1se = enet_rank_lambda_1se <= 15,
+    enet_top20_lambda_1se = enet_rank_lambda_1se <= 20,
+    enet_top25_lambda_1se = enet_rank_lambda_1se <= 25,
+    
+    enet_top15_custom = enet_rank_custom <= 15,
+    enet_top20_custom = enet_rank_custom <= 20,
+    enet_top25_custom = enet_rank_custom <= 25
+  )
+
+enet_compare <- enet_compare %>%
+  mutate(
+    enet_rank_lambda_min = rank(-abs_coef_lambda_min, ties.method = "min"),
+    enet_rank_lambda_1se = rank(-abs_coef_lambda_1se, ties.method = "min"),
+    enet_rank_custom = rank(-abs_coef_custom, ties.method = "min")
+  )
+
+head(enet_compare)
+
+
+```
+
+
+Collating all Screening methods result to get one table:
+
+```{r}
+all_screening_tbl <- enet_compare %>%
+  
+  left_join(
+    sis_compare,
+    by = "chemical"
+  ) %>%
+  left_join(
+    spls_tbl,
+    by = "chemical"
+  ) %>%
+  left_join(
+    xgb_tbl,
+    by = "chemical"
+  )
+
+head(all_screening_tbl)
+#Adding some summaries which will help me decide weights and validate assumptions
+all_screening_tbl <- all_screening_tbl %>%
+  mutate(
+    mean_rank_all = rowMeans(
+      cbind(
+        sis_rank,
+        dc_sis_rank,
+        enet_rank_lambda_min,
+        enet_rank_lambda_1se,
+        enet_rank_custom,
+        spls_rank,
+        xgb_rank
+      ),
+      na.rm = TRUE
+    ),
+    
+    n_top15_methods =
+      sis_top15 + dc_sis_top15 +
+      enet_top15_lambda_min + enet_top15_lambda_1se + enet_top15_custom +
+      spls_top15 + xgb_top15,
+    
+    n_top20_methods =
+      sis_top20 + dc_sis_top20 +
+      enet_top20_lambda_min + enet_top20_lambda_1se + enet_top20_custom +
+      spls_top20 + xgb_top20,
+    
+    n_top25_methods =
+      sis_top25 + dc_sis_top25 +
+      enet_top25_lambda_min + enet_top25_lambda_1se + enet_top25_custom +
+      spls_top25 + xgb_top25
+  ) %>%
+  arrange(desc(n_top15_methods), mean_rank_all)
+
+
+write.csv(all_screening_tbl, "Collated_Screening_Results.csv", row.names = FALSE)
+
+```
+
+Data Visualisation for comparing different methods:
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(forcats)
+
+heatmap_tbl <- all_screening_tbl %>%
+  slice_min(mean_rank_all, n = 20) %>%
+  dplyr::select(
+    chemical,
+    sis_rank,
+    dc_sis_rank,
+    enet_rank_lambda_min,
+    enet_rank_lambda_1se,
+    enet_rank_custom,
+    spls_rank,
+    xgb_rank
+  ) %>%
+  pivot_longer(
+    cols = -chemical,
+    names_to = "method",
+    values_to = "rank"
+  ) %>%
+  mutate(
+    method = factor(
+      method,
+      levels = c(
+        "sis_rank",
+        "dc_sis_rank",
+        "enet_rank_lambda_min",
+        "enet_rank_lambda_1se",
+        "enet_rank_custom",
+        "spls_rank",
+        "xgb_rank"
+      ),
+      labels = c(
+        "SIS",
+        "DC-SIS",
+        "ENet min",
+        "ENet 1se",
+        "ENet custom",
+        "sPLS",
+        "XGBoost"
+      )
+    )
+  )
+
+ggplot(heatmap_tbl,
+       aes(x = method,
+           y = fct_reorder(chemical, rank, .fun = min),
+           fill = rank)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = rank), size = 3) +
+  scale_fill_viridis_c(direction = -1) +
+  labs(
+    x = NULL,
+    y = NULL,
+    fill = "Rank",
+    title = "Top 20 chemicals across screening methods"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+
+Run each method multiple times, s.d., how stable is each method
+rank 1: down weight by how unsure we are : weight= exp(-k*sd)
+run this method iteratively (20-50x) and look at results and find s.d.
+
+
+Bump Chart:
+```{r}
+library(tidyverse)
+library(ggplot2)
+
+bump_tbl <- all_screening_tbl %>%
+  slice_min(mean_rank_all, n = 10) %>%
+  dplyr::select(
+    chemical,
+    sis_rank,
+    dc_sis_rank,
+    enet_rank_lambda_min,
+    enet_rank_lambda_1se,
+    enet_rank_custom,
+    spls_rank,
+    xgb_rank
+  ) %>%
+  pivot_longer(
+    cols = -chemical,
+    names_to = "method",
+    values_to = "rank"
+  ) %>%
+  mutate(
+    method = factor(
+      method,
+      levels = c(
+        "sis_rank",
+        "dc_sis_rank",
+        "enet_rank_lambda_min",
+        "enet_rank_lambda_1se",
+        "enet_rank_custom",
+        "spls_rank",
+        "xgb_rank"
+      ),
+      labels = c(
+        "SIS",
+        "DC-SIS",
+        "ENet min",
+        "ENet 1se",
+        "ENet custom",
+        "sPLS",
+        "XGBoost"
+      )
+    )
+  )
+
+ggplot(bump_tbl,
+       aes(x = method, y = rank, group = chemical, color = chemical)) +
+  geom_line(size = 1.1, smooth = 8) +
+  geom_point(size = 2) +
+  scale_y_reverse(breaks = 1:20) +
+  labs(
+    x = NULL,
+    y = "Rank",
+    title = "Rank movement across screening methods"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+
+```
+
+
+
+## Weighting Based on Stability of each method
+
+```{r}
+
+set.seed(2026)
+
+n_runs <- 30
+k_penalty <- 0.08
+top_n_final <- 20
+
+alpha_fixed <- 0.5
+lambda_fixed <- exp(-2.8)
+
+spls_ncomp_fixed <- 2
+spls_keepX_fixed <- c(15, 20)
+
+method_names <- c(
+  "sis_rank",
+  "dc_sis_rank",
+  "enet_rank",
+  "spls_rank",
+  "xgb_rank"
+)
+
+```
+
+We will used bootstrapped samples to see which are the most stable methods based on standard deviations and lower the standard deviation higher the weight in voting.
+
+```{r}
+
+rank_from_score <- function(scores, decreasing = TRUE) {
+  if (decreasing) rank(-scores, ties.method = "average")
+  else rank(scores, ties.method = "average")
+}
+
+#One Bootstrapped run
+run_screening_once <- function(run_id, X, y, chem_cols) {
+  
+  set.seed(5000 + run_id)
+  boot_idx <- sample(seq_len(nrow(X)), size = nrow(X), replace = TRUE)
+  
+  Xb <- X[boot_idx, , drop = FALSE]
+  yb <- y[boot_idx]
+  
+  # Elastic Net (fixed alpha, fixed lambda)
+  
+  enet_fit_run <- glmnet(
+    x = Xb,
+    y = yb,
+    alpha = 0.5,
+    lambda = exp(-2.8),
+    family = "gaussian",
+    standardize = TRUE
+  )
+  
+  coef_enet_run <- coef(enet_fit_run, s = lambda_fixed)
+  
+  enet_tbl_run <- tibble(
+    chemical = rownames(coef_enet_run),
+    enet_score = abs(as.numeric(coef_enet_run))
+  ) %>%
+    filter(chemical != "(Intercept)") %>%
+    mutate(enet_rank = rank_from_score(enet_score, decreasing = TRUE)) %>%
+    dplyr::select(chemical, enet_rank)
+  
+  # SIS Pearson
+  
+  sis_tbl_run <- tibble(
+    chemical = chem_cols,
+    sis_score = map_dbl(chem_cols, ~ abs(cor(Xb[, .x], yb, use = "complete.obs")))
+  ) %>%
+    mutate(sis_rank = rank_from_score(sis_score, decreasing = TRUE)) %>%
+    dplyr::select(chemical, sis_rank)
+  
+  # DC-SIS
+
+  dc_sis_tbl_run <- tibble(
+    chemical = chem_cols,
+    dc_sis_score = map_dbl(chem_cols, ~ dccpp::dcor(Xb[, .x], yb))
+  ) %>%
+    mutate(dc_sis_rank = rank_from_score(dc_sis_score, decreasing = TRUE)) %>%
+    dplyr::select(chemical, dc_sis_rank)
+  
+  # sparse PLS 
+  
+  spls_fit_run <- spls(
+    X = as.matrix(Xb),
+    Y = yb,
+    ncomp = 2,
+    keepX = c(15, 20),
+    mode = "regression"
+  )
+  
+  loadings_run <- spls_fit_run$loadings$X
+  
+  spls_tbl_run <- tibble(
+    chemical = rownames(loadings_run),
+    spls_score = rowSums(abs(loadings_run))
+  ) %>%
+    mutate(spls_rank = rank_from_score(spls_score, decreasing = TRUE)) %>%
+    dplyr::select(chemical, spls_rank)
+ 
+  # XGBoost (fixed parameters)
+  
+  dtrain_run <- xgb.DMatrix(data = as.matrix(Xb), label = yb)
+  
+  xgb_fit_run <- xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      eval_metric = "rmse",
+      eta = 0.05,
+      max_depth = 4,
+      min_child_weight = 3,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      lambda = 1,
+      alpha = 0
+    ),
+    data = dtrain_run,
+    nrounds = 200,
+    verbose = 0
+  )
+  
+  xgb_imp_run <- xgb.importance(
+    feature_names = colnames(Xb),
+    model = xgb_fit_run
+  )
+  
+  xgb_tbl_run <- tibble(chemical = colnames(Xb)) %>%
+    left_join(
+      as_tibble(xgb_imp_run) %>%
+        transmute(chemical = Feature, xgb_score = Gain),
+      by = "chemical"
+    ) %>%
+    mutate(xgb_score = replace_na(xgb_score, 0)) %>%
+    mutate(xgb_rank = rank_from_score(xgb_score, decreasing = TRUE)) %>%
+    dplyr::select(chemical, xgb_rank)
+  
+  
+  # Join all ranks
+  
+  sis_tbl_run %>%
+    left_join(dc_sis_tbl_run, by = "chemical") %>%
+    left_join(enet_tbl_run, by = "chemical") %>%
+    left_join(spls_tbl_run, by = "chemical") %>%
+    left_join(xgb_tbl_run, by = "chemical") %>%
+    mutate(run = run_id)
+}
+```
+
+Executing bootstrapped runs
+
+```{r}
+
+# REPEATED BOOTSTRAP RUNS
+
+rank_runs <- map_dfr(1:n_runs, ~ run_screening_once(.x, X, y, chem_cols))
+
+write.csv(rank_runs, "Repeated_Bootstrap_Method_Ranks.csv", row.names = FALSE)
+
+
+# METHOD STABILITY
+# Mean SD of chemical ranks within each method
+
+method_stability <- map_dfr(method_names, function(m) {
+  rank_runs %>%
+    group_by(chemical) %>%
+    summarise(rank_sd = sd(.data[[m]], na.rm = TRUE), .groups = "drop") %>%
+    summarise(
+      method = m,
+      mean_rank_sd = mean(rank_sd, na.rm = TRUE),
+      median_rank_sd = median(rank_sd, na.rm = TRUE)
+    )
+})
+
+method_stability <- method_stability %>%
+  mutate(
+    raw_weight = exp(-k_penalty * mean_rank_sd),
+    weight = raw_weight / sum(raw_weight)
+  ) %>%
+  arrange(desc(weight))
+
+write.csv(method_stability, "Method_Stability_Weights.csv", row.names = FALSE)
+
+
+# AVERAGE RANKS ACROSS BOOTSTRAP RUNS
+
+avg_rank_tbl <- rank_runs %>%
+  group_by(chemical) %>%
+  summarise(
+    sis_rank = mean(sis_rank, na.rm = TRUE),
+    dc_sis_rank = mean(dc_sis_rank, na.rm = TRUE),
+    enet_rank = mean(enet_rank, na.rm = TRUE),
+    spls_rank = mean(spls_rank, na.rm = TRUE),
+    xgb_rank = mean(xgb_rank, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+# WEIGHTED COMPOSITE RANK
+
+weight_vec <- method_stability$weight
+names(weight_vec) <- method_stability$method
+
+final_rank_tbl <- avg_rank_tbl %>%
+  mutate(
+    composite_score =
+      weight_vec["sis_rank"] * sis_rank +
+      weight_vec["dc_sis_rank"] * dc_sis_rank +
+      weight_vec["enet_rank"] * enet_rank +
+      weight_vec["spls_rank"] * spls_rank +
+      weight_vec["xgb_rank"] * xgb_rank
+  ) %>%
+  arrange(composite_score) %>%
+  mutate(
+    composite_rank = row_number()
+  )
+
+top20_final_tbl <- final_rank_tbl %>%
+  slice_head(n = top_n_final)
+
+
+# FINAL TABLE WITH INDIVIDUAL RANKS + COMPOSITE
+
+final_table <- final_rank_tbl %>%
+  dplyr::select(
+    chemical,
+    sis_rank,
+    dc_sis_rank,
+    enet_rank,
+    spls_rank,
+    xgb_rank,
+    composite_score,
+    composite_rank
+  )
+
+write.csv(final_table, "Final_Composite_Ranking_Table.csv", row.names = FALSE)
+write.csv(top20_final_tbl, "Top20_Composite_Chemicals.csv", row.names = FALSE)
+
+
+# METHOD WEIGHTS TABLE
+
+method_weights_table <- method_stability %>%
+  dplyr::select(method, mean_rank_sd, median_rank_sd, weight)
+
+write.csv(method_weights_table, "Method_Weights_Table.csv", row.names = FALSE)
+```
+
+```{r}
+
+top20_final_tbl
+method_weights_table
+```
+
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(scales)
+
+# top20_final_tbl should contain:
+# chemical, sis_rank, dc_sis_rank, enet_rank, spls_rank, xgb_rank, composite_score
+#
+# method_weights_table should contain:
+# method, mean_rank_sd, median_rank_sd, weight
+
+# Order chemicals by composite score: lower = better
+plot_dat <- top20_final_tbl %>%
+  arrange(composite_score) %>%
+  mutate(chemical = factor(chemical, levels = chemical))
+
+# Long format for method-specific rank plot
+rank_long <- plot_dat %>%
+  dplyr::select(chemical, sis_rank, dc_sis_rank, enet_rank, spls_rank, xgb_rank) %>%
+  pivot_longer(
+    cols = -chemical,
+    names_to = "method",
+    values_to = "rank"
+  ) %>%
+  mutate(
+    method = recode(
+      method,
+      sis_rank = "SIS",
+      dc_sis_rank = "DC-SIS",
+      enet_rank = "Elastic Net",
+      spls_rank = "sPLS",
+      xgb_rank = "XGBoost"
+    )
+  )
+
+# 1) Multi-line plot of ranks across methods
+p1 <- ggplot(rank_long, aes(x = chemical, y = rank, color = method, group = method)) +
+  geom_line(linewidth = 0.9, alpha = 0.9) +
+  geom_point(size = 2) +
+  scale_y_reverse(breaks = pretty_breaks(n = 8)) +
+  labs(
+    title = "Method-Specific Rankings of Top Chemicals",
+    x = "Chemical",
+    y = "Rank (1 = best)",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank(),
+    legend.position = "top"
+  )
+
+# Save first plot
+ggsave(
+  filename = "top20_final_tbl.png",
+  plot = p1,
+  width = 11,
+  height = 6.5,
+  dpi = 300
+)
+
+# 2) Single-line plot of composite score
+p2 <- ggplot(plot_dat, aes(x = chemical, y = composite_score, group = 1)) +
+  geom_line(color = "#2C3E50", linewidth = 1) +
+  geom_point(color = "#C0392B", size = 2.5) +
+  scale_y_reverse() +
+  labs(
+    title = "Composite Ranking of Top Chemicals",
+    x = "Chemical",
+    y = "Composite Rank"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.minor = element_blank()
+  )
+
+# Save second plot
+ggsave(
+  filename = "method_weights_table.png",
+  plot = p2,
+  width = 11,
+  height = 6,
+  dpi = 300
+)
+```
