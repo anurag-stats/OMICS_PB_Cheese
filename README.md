@@ -33,4 +33,6 @@ ranks_each_method.png : Line plot for each of the top 20 chemicals, based on com
 
 PB_Chees_OMICS : A consulting style report that gives a complete overview of the project, everything that was achieved and uncovered and recommended next steps.
 
+For every Rmd file there is a corresponding R script which was generated using the same Rmd file.
+
 
